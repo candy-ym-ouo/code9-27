@@ -6,6 +6,7 @@ import { toAlbumDto, toGapDto, toInspirationDto, type SerializeContext } from '.
 import { loadTiming } from './windowEngine.js';
 import { fuzzSpotCached, type PlaceRow, type SpotRow } from './fuzzing.js';
 import type { AssetRow } from './assets.js';
+import { requireInspiration } from './inspirations.js';
 
 export const ALBUM_RULE_DEFAULTS = {
   totalMin: 6,
@@ -195,6 +196,8 @@ export function addItem(
   caption?: string | null,
 ): void {
   requireAlbum(albumId, libraryId);
+  // 画册与灵感卡必须同库，防止把他库资源塞进本库画册再经分享越权读取
+  requireInspiration(inspirationId, libraryId);
   const db = getDb();
   const maxOrder = (
     db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM album_item WHERE album_id = ?').get(albumId) as {

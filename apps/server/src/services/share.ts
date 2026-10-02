@@ -21,6 +21,48 @@ export interface ShareLinkRow {
   created_at: string;
 }
 
+/**
+ * 资源归属校验：被分享的 album / inspiration 必须真实存在且属于发起分享的库。
+ * 创建、公开访问、图片三条链路都必须调用——只在创建时校验不够，
+ * 因为历史上可能已经写入过跨库的非法分享行。
+ */
+export function assertShareScopeOwned(
+  scope: 'album' | 'inspiration',
+  scopeId: string,
+  libraryId: string,
+): void {
+  const table = scope === 'album' ? 'album' : 'inspiration';
+  const row = getDb()
+    .prepare(`SELECT library_id FROM ${table} WHERE id = ? AND deleted_at IS NULL`)
+    .get(scopeId) as { library_id: string } | undefined;
+  if (!row) throw errors.notFound(scope === 'album' ? '画册' : '灵感卡');
+  if (row.library_id !== libraryId) throw errors.scopeDenied();
+}
+
+/**
+ * 图片归属校验：图片不仅要落在分享范围内，还必须与分享链接属于同一个库，
+ * 否则可借"他库画册里恰好引用了本库 asset"之类的错配行越权取图。
+ */
+export function assertAssetInShareScope(
+  asset: { library_id: string; inspiration_id: string },
+  link: Pick<ShareLinkRow, 'scope' | 'scope_id' | 'library_id'>,
+  db: ReturnType<typeof getDb>,
+): boolean {
+  if (asset.library_id !== link.library_id) return false;
+  if (link.scope === 'inspiration') {
+    return asset.inspiration_id === link.scope_id;
+  }
+  return Boolean(
+    db
+      .prepare(
+        `SELECT 1 AS x
+           FROM album_item ai JOIN album a ON a.id = ai.album_id
+          WHERE ai.album_id = ? AND ai.inspiration_id = ? AND a.library_id = ? AND a.deleted_at IS NULL`,
+      )
+      .get(link.scope_id, asset.inspiration_id, link.library_id),
+  );
+}
+
 export function createShareLink(params: {
   libraryId: string;
   scope: 'album' | 'inspiration';
@@ -31,6 +73,9 @@ export function createShareLink(params: {
   userId: string;
 }): ShareLinkRow {
   if (!config.enableShare) throw errors.badRequest('分享功能已被服务端关闭（ENABLE_SHARE=false）');
+
+  // 归属底线：禁止用本库身份为他库资源创建分享链接
+  assertShareScopeOwned(params.scope, params.scopeId, params.libraryId);
 
   // 安全底线：exact / g100 一律强制降级为 g500（不抛错，避免"手填就绕过"）
   const level = assertShareFuzzLevel(params.fuzzLevel);
@@ -83,6 +128,9 @@ export function validateShareToken(token: string, password?: string | null): Sha
       throw errors.sharePasswordRequired();
     }
   }
+  // 每次访问都复核资源归属：历史数据里可能已存在跨库的非法分享行，
+  // 撤销/过期之外，资源不属于本库同样必须拒绝（创建、访问、图片三链路一致）。
+  assertShareScopeOwned(row.scope, row.scope_id, row.library_id);
   return row;
 }
 

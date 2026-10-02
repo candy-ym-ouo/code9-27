@@ -379,6 +379,135 @@ describe('E7 隐私：模糊化、强制降级与撤销', () => {
   });
 });
 
+describe('E7b 跨库归属：本库身份不得触碰他库画册/图片', () => {
+  let attackerToken = '';
+  let attackerLibraryId = '';
+  let victimAlbumId = '';
+  let victimAssetId = '';
+
+  /** 用指定令牌发请求（空串 = 匿名），不污染全局 token */
+  function callAs(
+    bearer: string,
+    method: 'get' | 'post',
+    url: string,
+    body?: unknown,
+  ): request.Test {
+    let req = request(app)[method](url);
+    if (bearer) req = req.set('authorization', `Bearer ${bearer}`);
+    if (body !== undefined) req = req.send(body as object);
+    return req;
+  }
+
+  it('准备：第二个账号（攻击者）拿到自己的库身份', async () => {
+    const attacker = await callAs('', 'post', '/api/auth/register', {
+      email: 'attacker@test.local',
+      password: 'password123',
+      displayName: '攻击者',
+    });
+    expect(attacker.status).toBe(201);
+    attackerToken = attacker.body.token;
+    attackerLibraryId = attacker.body.user.libraryId;
+    expect(attackerLibraryId).toBeTruthy();
+  });
+
+  it('直接在受害者库插入一本画册和一张图片，模拟攻击者已知其 id（不经任何授权）', async () => {
+    const { getDb, newId, nowIso } = await import('../src/db.js');
+    const sharp = (await import('sharp')).default;
+    const db = getDb();
+    const ownerLibraryId = (
+      db.prepare('SELECT l.id AS library_id FROM "user" u JOIN library l ON l.owner_id = u.id WHERE u.email = ?').get(
+        'owner@test.local',
+      ) as { library_id: string }
+    ).library_id;
+    expect(ownerLibraryId).not.toBe(attackerLibraryId);
+
+    victimAlbumId = newId();
+    db.prepare(
+      "INSERT INTO album (id, library_id, title, theme_note, status, rules, created_at, updated_at) VALUES (?,?,?,?, 'published', '{}', ?, ?)",
+    ).run(victimAlbumId, ownerLibraryId, '受害者密藏画册', null, nowIso(), nowIso());
+
+    // 受害者库内、挂在受害者灵感卡上的真实图片文件
+    const victimFile = path.join(tmpDir, 'victim.jpg');
+    await sharp({ create: { width: 8, height: 8, channels: 3, background: '#123456' } })
+      .jpeg()
+      .toFile(victimFile);
+    victimAssetId = newId();
+    db.prepare(
+      `INSERT INTO asset (id, library_id, inspiration_id, role, file_path, thumb_path, palette, created_at, updated_at)
+       VALUES (?,?,?, 'reference', ?, NULL, '[]', ?, ?)`,
+    ).run(victimAssetId, ownerLibraryId, cardId, victimFile, nowIso(), nowIso());
+  });
+
+  it('创建链路①：用攻击者身份为他库画册建分享 → 403', async () => {
+    const res = await callAs(attackerToken, 'post', '/api/share-links', {
+      scope: 'album',
+      scopeId: victimAlbumId,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+  });
+
+  it('创建链路②：用攻击者身份为他库灵感卡建分享 → 403', async () => {
+    const res = await callAs(attackerToken, 'post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: cardId,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+  });
+
+  it('无法通过 API 造出跨库链接；即便库里存在历史非法分享行，公开访问也被拒', async () => {
+    const { getDb, newId, nowIso } = await import('../src/db.js');
+    const db = getDb();
+    const forgedToken = `forged-${newId()}`;
+    const attackerUserId = (db.prepare('SELECT id FROM "user" WHERE email = ?').get('attacker@test.local') as {
+      id: string;
+    }).id;
+    db.prepare(
+      `INSERT INTO share_link (id, library_id, scope, scope_id, token, fuzz_level, password_hash,
+         expires_at, created_by, view_count, created_at)
+       VALUES (?, ?, 'album', ?, ?, 'g500', NULL, ?, ?, 0, ?)`,
+    ).run(
+      newId(),
+      attackerLibraryId,
+      victimAlbumId,
+      forgedToken,
+      new Date(Date.now() + 86400000).toISOString(),
+      attackerUserId,
+      nowIso(),
+    );
+
+    const view = await callAs('', 'get', `/api/share/${forgedToken}`);
+    expect([403, 404]).toContain(view.status);
+  });
+
+  it('图片链路：攻击者自己的合法画册分享，不得借此读取受害者库的图片', async () => {
+    const album = await callAs(attackerToken, 'post', '/api/albums', { title: '攻击者画册', rules: {} });
+    const link = await callAs(attackerToken, 'post', '/api/share-links', {
+      scope: 'album',
+      scopeId: album.body.id,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(link.status).toBe(201);
+
+    const img = await callAs('', 'get', `/api/share/${link.body.token}/assets/${victimAssetId}`);
+    expect([403, 404]).toContain(img.status);
+  });
+
+  it('补充：不能把他库灵感卡塞进本库画册', async () => {
+    const album = await callAs(attackerToken, 'post', '/api/albums', { title: '攻击者画册2', rules: {} });
+    const res = await callAs(attackerToken, 'post', `/api/albums/${album.body.id}/items`, {
+      inspirationId: cardId,
+    });
+    expect([403, 404]).toContain(res.status);
+  });
+});
+
 describe('E8 检索与零结果兜底', () => {
   it('按标签检索命中', async () => {
     const res = await call('get', `/api/search?tagIds=${tagIds['逆光']}`);

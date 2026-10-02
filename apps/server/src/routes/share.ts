@@ -8,6 +8,7 @@ import { authenticate } from '../http/middleware.js';
 import { ctxOf } from '../http/context.js';
 import { errors } from '../http/errors.js';
 import {
+  assertAssetInShareScope,
   createShareLink,
   listAccessLogs,
   listShareLinks,
@@ -140,6 +141,8 @@ publicShareRouter.get(
 
     if (link.scope === 'album') {
       const snapshot = getSnapshot(link.scope_id);
+      // 未发布（无快照）的画册即使存在有效链接也不允许读取内容
+      if (!snapshot) throw errors.notFound('画册快照');
       const items = albumItemsDetailed(link.scope_id, ctx);
       logAccess(link.id, true);
       return ok(res, {
@@ -189,18 +192,8 @@ publicShareRouter.get(
     const asset = db.prepare('SELECT * FROM asset WHERE id = ?').get(req.params.assetId) as AssetRow | undefined;
     if (!asset) throw errors.notFound('图片');
 
-    // 越权检查：该图片必须属于本次分享范围
-    let allowed = false;
-    if (link.scope === 'inspiration') {
-      allowed = asset.inspiration_id === link.scope_id;
-    } else {
-      allowed = Boolean(
-        db
-          .prepare('SELECT 1 AS x FROM album_item WHERE album_id = ? AND inspiration_id = ?')
-          .get(link.scope_id, asset.inspiration_id),
-      );
-    }
-    if (!allowed) {
+    // 越权检查：图片必须与分享链接同库，且落在本次分享范围内（album 还要复核画册归属）
+    if (!assertAssetInShareScope(asset, link, db)) {
       logAccess(link.id, false, 'asset_out_of_scope');
       throw errors.scopeDenied();
     }
