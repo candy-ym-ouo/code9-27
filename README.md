@@ -43,8 +43,8 @@ npm start          # 后端 3000 端口同时托管前端，SPA fallback 已配�
 ## 验证（这三条命令就是"真的能跑"的证明）
 
 ```bash
-npm test                        # 76 个自动化测试：天文 / 几何 / geohash / 窗口判定 / API 闭环
-npm run smoke                   # 69 项真实 HTTP 断言（需先启动服务端）
+npm test                        # 84 个自动化测试：天文 / 几何 / geohash / 窗口判定 / API 闭环 / 跨库分享越权
+npm run smoke                   # 75 项真实 HTTP 断言（需先启动服务端）
 npm run test:e2e                # 2 个真实浏览器闭环用例（需先 npm run build && npm start）
 ```
 

@@ -21,6 +21,45 @@ export interface ShareLinkRow {
   created_at: string;
 }
 
+/**
+ * 归属校验：分享目标必须真实存在、未删除且属于本库。
+ * 不做这层检查，调用方就能"用本库身份给别库资源发令牌"，公开页随后按 link.library_id
+ * 取数，形成跨库越权读取。对调用方统一返回 404，避免泄露他库资源是否存在。
+ */
+export function assertShareScopeOwned(
+  scope: 'album' | 'inspiration',
+  scopeId: string,
+  libraryId: string,
+): void {
+  const db = getDb();
+  if (scope === 'album') {
+    const row = db
+      .prepare('SELECT library_id FROM album WHERE id = ? AND deleted_at IS NULL')
+      .get(scopeId) as { library_id: string } | undefined;
+    if (!row || row.library_id !== libraryId) throw errors.notFound('画册');
+  } else {
+    const row = db
+      .prepare('SELECT library_id FROM inspiration WHERE id = ? AND deleted_at IS NULL')
+      .get(scopeId) as { library_id: string } | undefined;
+    if (!row || row.library_id !== libraryId) throw errors.notFound('灵感卡');
+  }
+}
+
+/**
+ * 公开访问侧的归属校验：分享范围必须仍属于链接所在库。
+ * 这是纵深防御——即使历史上已存在跨库的 share_link（修复前写入的数据），
+ * 公开页也不能把它当作合法链接吐出内容。资源不存在返回 404，存在但不属本库返回 403。
+ */
+export function assertShareScopeMatchesLink(link: ShareLinkRow): void {
+  const db = getDb();
+  const table = link.scope === 'album' ? 'album' : 'inspiration';
+  const row = db
+    .prepare(`SELECT library_id FROM ${table} WHERE id = ? AND deleted_at IS NULL`)
+    .get(link.scope_id) as { library_id: string } | undefined;
+  if (!row) throw errors.notFound('分享链接');
+  if (row.library_id !== link.library_id) throw errors.scopeDenied();
+}
+
 export function createShareLink(params: {
   libraryId: string;
   scope: 'album' | 'inspiration';
@@ -31,6 +70,9 @@ export function createShareLink(params: {
   userId: string;
 }): ShareLinkRow {
   if (!config.enableShare) throw errors.badRequest('分享功能已被服务端关闭（ENABLE_SHARE=false）');
+
+  // 创建链路归属校验：禁止用本库身份为他库画册/灵感卡创建分享
+  assertShareScopeOwned(params.scope, params.scopeId, params.libraryId);
 
   // 安全底线：exact / g100 一律强制降级为 g500（不抛错，避免"手填就绕过"）
   const level = assertShareFuzzLevel(params.fuzzLevel);

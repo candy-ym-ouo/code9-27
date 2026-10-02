@@ -379,6 +379,169 @@ describe('E7 隐私：模糊化、强制降级与撤销', () => {
   });
 });
 
+describe('E7b 跨库分享越权防护（创建 / 访问 / 图片三链路）', () => {
+  let ownerToken = '';
+  let attackerToken = '';
+  let victimCard = '';
+  let victimAlbum = '';
+  let victimAssetId = '';
+
+  // 构造一个 1x1 PNG（sharp 可识别）
+  const pngOnePx = Buffer.from(
+    '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000100ffff03000006000557bfabd40000000049454e44ae426082',
+    'hex',
+  );
+
+  it('准备：受害者（owner）与攻击者（第二个注册的库）各自就绪', async () => {
+    const saved = token;
+
+    const victim = await call('post', '/api/auth/register', {
+      email: 'victim-share@test.local',
+      password: 'password123',
+      displayName: '受害者',
+    });
+    expect(victim.status).toBe(201);
+    ownerToken = victim.body.token;
+    token = ownerToken;
+
+    const card = await call('post', '/api/inspirations', { title: '受害者的秘密灵感卡' });
+    victimCard = card.body.id;
+
+    // 建一个无必需缺口的画册并加入该灵感卡，使其可发布
+    const album = await call('post', '/api/albums', {
+      title: '受害者私藏画册',
+      rules: { requireTags: [], requireAnchors: [], requireWeather: [], totalMin: 1, autoMatch: { enabled: false, minTagHits: 1 } },
+    });
+    victimAlbum = album.body.id;
+    await call('post', `/api/albums/${victimAlbum}/items`, { inspirationId: victimCard });
+    await call('post', `/api/albums/${victimAlbum}/gaps`);
+
+    const upload = await request(app)
+      .post(`/api/inspirations/${victimCard}/assets`)
+      .set('authorization', `Bearer ${ownerToken}`)
+      .attach('files', pngOnePx, 'secret.png');
+    expect(upload.status).toBe(201);
+    victimAssetId = upload.body.items[0].assetId;
+
+    const attacker = await call('post', '/api/auth/register', {
+      email: 'attacker-share@test.local',
+      password: 'password123',
+      displayName: '攻击者',
+    });
+    expect(attacker.status).toBe(201);
+    attackerToken = attacker.body.token;
+
+    token = saved;
+  });
+
+  it('创建链路①：攻击者不能为受害者的灵感卡创建分享链接', async () => {
+    const saved = token;
+    token = attackerToken;
+    const res = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: victimCard,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(res.status).toBe(404);
+    token = saved;
+  });
+
+  it('创建链路②：攻击者不能为受害者的画册创建分享链接', async () => {
+    const saved = token;
+    token = attackerToken;
+    const res = await call('post', '/api/share-links', {
+      scope: 'album',
+      scopeId: victimAlbum,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(res.status).toBe(404);
+    token = saved;
+  });
+
+  it('创建链路③：攻击者不能在发布受害者画册时夹带分享链接', async () => {
+    const saved = token;
+    token = attackerToken;
+    const res = await call('post', `/api/albums/${victimAlbum}/publish`, {
+      createShare: true,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect([403, 404]).toContain(res.status);
+    expect(res.body.shareToken).toBeUndefined();
+    token = saved;
+  });
+
+  it('攻击入口：攻击者不能把受害者灵感卡塞进自己的画册（后续发布/分享的前置）', async () => {
+    const saved = token;
+    token = attackerToken;
+    const ownAlbum = await call('post', '/api/albums', {
+      title: '攻击者的画册',
+      rules: { requireTags: [], requireAnchors: [], requireWeather: [], totalMin: 1, autoMatch: { enabled: false, minTagHits: 1 } },
+    });
+    const res = await call('post', `/api/albums/${ownAlbum.body.id}/items`, {
+      inspirationId: victimCard,
+    });
+    expect([403, 404]).toContain(res.status);
+
+    // 塞不进去：攻击者画册详情里不应出现受害者的卡
+    const detail = await call('get', `/api/albums/${ownAlbum.body.id}`);
+    expect(JSON.stringify(detail.body)).not.toContain(victimCard);
+    token = saved;
+  });
+
+  it('访问链路：伪造/历史遗留的跨库分享令牌无法读到受害者画册内容', async () => {
+    const { getDb } = await import('../src/db.js');
+    const db = getDb();
+    // 直接从 JWT 取攻击者身份（测试辅助，不走业务接口）
+    const payload = JSON.parse(
+      Buffer.from(attackerToken.split('.')[1], 'base64url').toString('utf8'),
+    ) as { libraryId: string; id: string };
+
+    // 模拟修复前可能落库的"跨库 share_link"：library_id=攻击者库，scope_id=受害者画册
+    db.prepare(
+      `INSERT INTO share_link (id, library_id, scope, scope_id, token, fuzz_level, password_hash,
+         expires_at, created_by, view_count, created_at)
+       VALUES (?,?,?,?,?,?,NULL,?, ?, 0, ?)`,
+    ).run('rogue-share-link-0001', payload.libraryId, 'album', victimAlbum, 'rogue-token-0001', 'g500', new Date(Date.now() + 86400000).toISOString(), payload.id, new Date().toISOString());
+
+    const saved = token;
+    token = '';
+    const view = await call('get', '/api/share/rogue-token-0001');
+    expect([403, 404]).toContain(view.status);
+    expect(JSON.stringify(view.body)).not.toContain('受害者');
+    token = saved;
+  });
+
+  it('图片链路①：跨库令牌拿不到受害者画册中图片的字节', async () => {
+    const saved = token;
+    token = '';
+    const res = await call('get', `/api/share/rogue-token-0001/assets/${victimAssetId}`);
+    expect([403, 404]).toContain(res.status);
+    token = saved;
+  });
+
+  it('图片链路②：攻击者自有灵感卡的合法分享链接，也读不到受害者图片', async () => {
+    const saved = token;
+    token = attackerToken;
+    const ownCard = await call('post', '/api/inspirations', { title: '攻击者自己的卡' });
+    const link = await call('post', '/api/share-links', {
+      scope: 'inspiration',
+      scopeId: ownCard.body.id,
+      fuzzLevel: 'g500',
+      expiresInDays: 1,
+    });
+    expect(link.status).toBe(201);
+    const ownToken = link.body.token;
+    token = '';
+
+    const res = await call('get', `/api/share/${ownToken}/assets/${victimAssetId}`);
+    expect([403, 404]).toContain(res.status);
+    token = saved;
+  });
+});
+
 describe('E8 检索与零结果兜底', () => {
   it('按标签检索命中', async () => {
     const res = await call('get', `/api/search?tagIds=${tagIds['逆光']}`);

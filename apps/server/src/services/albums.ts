@@ -5,6 +5,7 @@ import { errors } from '../http/errors.js';
 import { toAlbumDto, toGapDto, toInspirationDto, type SerializeContext } from './serialization.js';
 import { loadTiming } from './windowEngine.js';
 import { fuzzSpotCached, type PlaceRow, type SpotRow } from './fuzzing.js';
+import { requireInspiration } from './inspirations.js';
 import type { AssetRow } from './assets.js';
 
 export const ALBUM_RULE_DEFAULTS = {
@@ -195,6 +196,8 @@ export function addItem(
   caption?: string | null,
 ): void {
   requireAlbum(albumId, libraryId);
+  // 归属校验：灵感卡必须属于本库，否则可把他库内容塞进画册并经发布/分享带出
+  requireInspiration(inspirationId, libraryId);
   const db = getDb();
   const maxOrder = (
     db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS m FROM album_item WHERE album_id = ?').get(albumId) as {
@@ -558,9 +561,10 @@ export function albumItemsDetailed(albumId: string, ctx: SerializeContext): Insp
   const rows = db
     .prepare(
       `SELECT i.* FROM album_item ai JOIN inspiration i ON i.id = ai.inspiration_id
-       WHERE ai.album_id = ? ORDER BY ai.sort_order, ai.created_at`,
+       WHERE ai.album_id = ? AND i.library_id = ? AND i.deleted_at IS NULL
+       ORDER BY ai.sort_order, ai.created_at`,
     )
-    .all(albumId) as Record<string, unknown>[];
+    .all(albumId, ctx.libraryId) as Record<string, unknown>[];
   return rows.map((r) =>
     toInspirationDto(r as unknown as Parameters<typeof toInspirationDto>[0], ctx, { withWindowSummary: false }),
   );

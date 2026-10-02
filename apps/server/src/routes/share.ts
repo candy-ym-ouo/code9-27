@@ -8,6 +8,7 @@ import { authenticate } from '../http/middleware.js';
 import { ctxOf } from '../http/context.js';
 import { errors } from '../http/errors.js';
 import {
+  assertShareScopeMatchesLink,
   createShareLink,
   listAccessLogs,
   listShareLinks,
@@ -131,6 +132,8 @@ publicShareRouter.get(
   '/share/:token',
   ah(async (req, res) => {
     const link = validateShareToken(req.params.token, passwordFrom(req));
+    // 访问链路归属校验：分享范围必须仍属于链接所在库（防修复前遗留的跨库链接）
+    assertShareScopeMatchesLink(link);
     const ctx = {
       libraryId: link.library_id,
       role: 'member' as const,
@@ -139,6 +142,8 @@ publicShareRouter.get(
     };
 
     if (link.scope === 'album') {
+      // 画册本身已由 assertShareScopeMatchesLink 校验；条目在 SQL 层按库过滤，
+      // 防止 album_item 中混入（历史脏数据或其他缺陷写入的）他库灵感卡
       const snapshot = getSnapshot(link.scope_id);
       const items = albumItemsDetailed(link.scope_id, ctx);
       logAccess(link.id, true);
@@ -185,19 +190,31 @@ publicShareRouter.get(
   '/share/:token/assets/:assetId',
   ah(async (req, res) => {
     const link = validateShareToken(req.params.token, passwordFrom(req));
+    // 图片链路归属校验①：分享范围必须仍属于链接所在库
+    assertShareScopeMatchesLink(link);
     const db = getDb();
     const asset = db.prepare('SELECT * FROM asset WHERE id = ?').get(req.params.assetId) as AssetRow | undefined;
     if (!asset) throw errors.notFound('图片');
 
-    // 越权检查：该图片必须属于本次分享范围
+    // 图片链路归属校验②：图片本身必须属于链接所在库，杜绝跨库 id 碰撞/脏数据被令牌带出
+    if (asset.library_id !== link.library_id) {
+      logAccess(link.id, false, 'asset_cross_library');
+      throw errors.scopeDenied();
+    }
+
+    // 越权检查③：该图片必须属于本次分享范围
     let allowed = false;
     if (link.scope === 'inspiration') {
       allowed = asset.inspiration_id === link.scope_id;
     } else {
       allowed = Boolean(
         db
-          .prepare('SELECT 1 AS x FROM album_item WHERE album_id = ? AND inspiration_id = ?')
-          .get(link.scope_id, asset.inspiration_id),
+          .prepare(
+            `SELECT 1 AS x FROM album_item ai
+               JOIN album a ON a.id = ai.album_id
+              WHERE ai.album_id = ? AND ai.inspiration_id = ? AND a.library_id = ?`,
+          )
+          .get(link.scope_id, asset.inspiration_id, link.library_id),
       );
     }
     if (!allowed) {

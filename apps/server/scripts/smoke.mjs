@@ -279,6 +279,59 @@ async function main() {
   check('分享内容给出模糊地点标签', typeof view.json?.items?.[0]?.fuzz?.label === 'string');
   check('分享包含"照着做"的条件说明', typeof view.json?.snapshot?.payload?.conditionSummary === 'string');
 
+  // 13b. 跨库归属：别的库身份不能给本库资源发分享，也不能把本库卡片塞进他册
+  const outsiderEmail = `smoke-outsider-${Date.now()}@flil.local`;
+  const outsiderReg = await req('POST', '/auth/register', {
+    email: outsiderEmail,
+    password: 'password123',
+    displayName: '外部库的人',
+  });
+  check('第二个账号（独立库）注册成功', outsiderReg.status === 201);
+  const savedOwnerToken = token;
+  token = outsiderReg.json?.token;
+
+  const crossShareCard = await req('POST', '/share-links', {
+    scope: 'inspiration',
+    scopeId: cardId,
+    fuzzLevel: 'g500',
+    expiresInDays: 1,
+  });
+  check('他库身份不能为本库灵感卡创建分享（404 不泄露存在性）', crossShareCard.status === 404);
+
+  const crossShareAlbum = await req('POST', '/share-links', {
+    scope: 'album',
+    scopeId: albumId,
+    fuzzLevel: 'g500',
+    expiresInDays: 1,
+  });
+  check('他库身份不能为本库画册创建分享', crossShareAlbum.status === 404);
+
+  const outsiderAlbum = await req('POST', '/albums', {
+    title: '外部库画册',
+    rules: { requireTags: [], requireAnchors: [], requireWeather: [], totalMin: 1, autoMatch: { enabled: false, minTagHits: 1 } },
+  });
+  const crossAdd = await req('POST', `/albums/${outsiderAlbum.json?.id}/items`, { inspirationId: cardId });
+  check('他库身份不能把本库灵感卡塞进自己的画册', crossAdd.status === 403 || crossAdd.status === 404);
+
+  const outsiderOwnCard = await req('POST', '/inspirations', { title: '外部库自己的卡' });
+  const ownShare = await req('POST', '/share-links', {
+    scope: 'inspiration',
+    scopeId: outsiderOwnCard.json?.id,
+    fuzzLevel: 'g500',
+    expiresInDays: 1,
+  });
+  const outsiderAssetId = view.json?.items?.[0]?.assets?.[0]?.id;
+  if (outsiderAssetId && ownShare.json?.token) {
+    const crossAsset = await req(
+      'GET',
+      `/share/${ownShare.json.token}/assets/${outsiderAssetId}`,
+      undefined,
+      { noAuth: true },
+    );
+    check('他库分享令牌读不到本库图片字节', crossAsset.status === 403 || crossAsset.status === 404);
+  }
+  token = savedOwnerToken;
+
   const links = await req('GET', '/share-links');
   const link = (links.json?.items ?? [])[0];
   check('分享链接可被列表查看', Boolean(link?.id));
